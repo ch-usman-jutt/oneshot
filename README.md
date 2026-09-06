@@ -75,6 +75,10 @@ Three things fall out of that:
   15  close           code      label → Ready For Deployment, teardown
 
   ∥  runs concurrently with the phase above it
+
+  ⟨R⟩ the optional `Review` label adds three human pauses to this same list —
+      before 3, before 5, and inside 9. Nothing else changes: no phase is
+      added, removed or reordered. See "Optional human review gates".
 ```
 
 `merge` and `close` are **code, not sessions**. No model holds a merge tool, which is why One
@@ -136,6 +140,14 @@ resolves, never the request itself. That is a deliberate change from an earlier 
 mode, which asked and read on the ticket instead — reviewing a plan or a test-case list is more
 natural where the run's own status already lives, and the ticket stays a record of what happened
 rather than a second inbox to poll.
+
+```
+ … plan ──▶[ R1 approve the plan ]──▶ implement ──▶ testcases ──▶[ R2 approve the case list ]──▶ review …
+ … mr ──▶[ R3 a human merges the MR ]──▶ deploy ──▶ qa ──▶ demo ──▶ close
+
+ R1, R2   a Slack reply of `approved` releases the pause; anything else is feedback
+ R3       no keyword — the MR's own state turning `merged` is the signal
+```
 
 1. **Plan approval** — after phase 2 (`plan`), before phase 3 (`implement`). Oneshot posts the
    plan itself into the ticket's Slack thread and the run **parks**.
