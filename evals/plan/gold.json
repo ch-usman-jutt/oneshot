@@ -1,0 +1,79 @@
+{
+  "_about": "Hand labels for the plan eval: five arbisoft/workstreamai tickets whose change a person reviewed and merged, so the merged diff is the real answer. base = the commit the live run planned on (the fork point of its oneshot/ticket-* branch, read on the merge commit's first parent). must = source files the real change could not have skipped; ok = the rest of the real diff (tests, constants, max_migration.txt). A file outside must ∪ ok is reported, not failed: a plan can reasonably touch more than the change that landed. These iids are workstreamai's, so run with GITLAB_REPO_URL=https://gitlab.arbisoft.com/arbisoft/workstreamai and ONESHOT_WORKSTREAMAI_WORK_REPO pointing at a clone that has the oneshot/ticket-* branches (~/Desktop/workstreamai). Also set ONESHOT_WORKSTREAMAI_WT_ROOT, or the per-sample worktrees land in the ERP worktree root (they are removed after each sample either way).",
+  "cases": {
+    "28": {
+      "base": "08f535486c767355e5efaec3f42c21675022beb2",
+      "must": [
+        "common/utils.py",
+        "frontend/src/components/profile/components/BasicInformation.js",
+        "frontend/src/components/profile/logic/actions/profileUpdateActions.js",
+        "frontend/src/components/profile/logic/reducers/personDetailUpdateReducer.js"
+      ],
+      "ok": [
+        "common/utils_tests.py",
+        "frontend/src/common/constants/displayMessages.js"
+      ],
+      "migrations": false,
+      "why": "Full stack: a backend helper plus the profile form's action, reducer and component. Catches a plan that fixes only one side."
+    },
+    "29": {
+      "base": "08f535486c767355e5efaec3f42c21675022beb2",
+      "must": [
+        "apps/core/api/v1/views/chat_platform.py",
+        "apps/core/utils/reminders.py"
+      ],
+      "ok": [
+        "apps/core/admin.py",
+        "apps/core/tests/person_reminders_list_test.py",
+        "apps/core/tests/user_chat_platform_list_test.py"
+      ],
+      "migrations": false,
+      "why": "Backend only. The fix lives in the chat platform view and a reminders helper, not in a model, so a migration here is wrong."
+    },
+    "74": {
+      "base": "ea18ecb4f708525338085c1262a78c12a99c9f7e",
+      "must": [
+        "frontend/src/components/training/utils/TrainingFilter.js"
+      ],
+      "ok": [
+        "frontend/src/components/training/utils/TrainingSearchField.js",
+        "frontend/src/components/training/utils/__tests__/TrainingFilter.test.js"
+      ],
+      "migrations": false,
+      "why": "Small frontend fix in one shared component. The live plan added a Jest test, which the current prompt forbids."
+    },
+    "123": {
+      "base": "ea18ecb4f708525338085c1262a78c12a99c9f7e",
+      "must": [
+        "apps/expenses/models.py",
+        "apps/expenses/api/serializers/expense.py",
+        "apps/core/api/v1/views/shared.py",
+        "frontend/src/components/utils/FilesUploadZone.js"
+      ],
+      "ok": [
+        "apps/core/tests/upload_attachments_test.py",
+        "apps/expenses/migrations/0006_expenseattachment_display_name_and_more.py",
+        "apps/expenses/migrations/max_migration.txt",
+        "apps/expenses/tests/expense_attachment_display_name_test.py",
+        "apps/expenses/tests/utils.py",
+        "common/utils.py",
+        "frontend/src/components/expenses/person_view/__tests__/ExpenseForm.test.js",
+        "frontend/src/components/utils/UploadedAttachmentItem.js",
+        "frontend/src/components/utils/__tests__/UploadedAttachmentItem.test.js",
+        "frontend/src/components/utils/__tests__/attachmentHelpers.test.js",
+        "frontend/src/components/utils/attachmentHelpers.js"
+      ],
+      "migrations": true,
+      "why": "The only case with a schema change: a new display_name field on the attachment model. Catches migrations: false on a model change."
+    },
+    "179": {
+      "base": "7a21bb0097d41102cf4e8a439081025a1ae7155d",
+      "must": [
+        "frontend/src/jss/components/commonStyles.js"
+      ],
+      "ok": [],
+      "migrations": false,
+      "why": "A one-file style fix. The live plan also named five reminder and snapshot files the real change never touched, so this case is where scope sprawl shows."
+    }
+  }
+}
