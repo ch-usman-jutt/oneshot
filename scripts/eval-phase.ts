@@ -2,13 +2,16 @@
  * Replay ONE phase on stored tickets, N times each, and grade every answer.
  *
  * docs/FIX-PLAN.md §7: the smallest loop that can show a prompt change moved a
- * score on the same inputs. Not a framework — one phase is wired (`recall`),
- * and the next one is a grader function added to GRADERS.
+ * score on the same inputs. Not a framework — each wired phase is one entry in
+ * PHASES: its grader, and which frozen inputs it reads.
  *
  * Inputs are frozen so two runs differ only by the prompt:
  *   - tickets are fetched from GitLab once and cached in state/evals/tickets/
- *   - the memory is snapshotted once into state/evals/memory/ and copied into
- *     the dry home before every replay
+ *   - recall: the memory is snapshotted once into state/evals/memory/ and
+ *     copied into the dry home before every replay
+ *   - plan: the live run's recall.json and research.json are copied once into
+ *     state/evals/prior/<iid>/, and every sample gets its own detached worktree
+ *     at the commit the live run planned on (`base` in evals/plan/gold.json)
  *
  * It runs the phase through the production runPhase — same prompt builder,
  * model tier, schema, hooks and tool policy — under DRY_RUN, whose shadow home
@@ -19,18 +22,21 @@
  *   npm run eval -- recall 247 28 --n 5
  *   npm run eval -- recall --refresh-memory  # re-snapshot memory, keep the cached tickets
  *   npm run eval -- recall --refetch         # re-read the tickets, keep the snapshot
+ *   npm run eval -- plan --live              # grade the live runs' plan.json, no replay
  *
  * The two are separate because they go stale for different reasons: memory
  * grows with every completed run, while a ticket only needs re-reading when it
  * was edited. Re-reading also means asking GitLab, which only knows the ONE
  * project GITLAB_REPO_URL names today — see loadTicket.
  */
+import { execFileSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { DRY_RUN, MEMORY, ROOT, budgetConfig, phaseByName, repoIdentity } from '../src/lib/config.js';
+import { DRY_RUN, MEMORY, ROOT, WORK_REPO, budgetConfig, phaseByName, repoIdentity } from '../src/lib/config.js';
 import { allIssueNotes, getIssue } from '../src/lib/gitlab.js';
-import { isMachineNote } from '../src/lib/claims.js';
+import { ticketComments } from '../src/conductor/runner.js';
+import { removeReplayWorktree, replayWorktree } from '../src/lib/worktrees.js';
 import { promptFor, systemPromptFor, type PromptCtx } from '../src/phases/prompts.js';
 import { runPhase } from '../src/conductor/phase.js';
 import { transcriptPath, type RunJournal } from '../src/lib/artifacts.js';
@@ -48,12 +54,15 @@ const EVALS = join(ROOT, 'state', 'evals');
 const LIVE_MEMORY = join(ROOT, 'state', 'memory');
 const SNAPSHOT = join(EVALS, 'memory');
 const TICKETS = join(EVALS, 'tickets');
+const PRIOR = join(EVALS, 'prior');
 const PARALLEL = 4;
 
-interface Gold { must: number[]; ok: number[]; why: string }
+type Artifact = Record<string, unknown>;
 interface Check { name: string; pass: boolean; note?: string }
 interface ToolCall { name: string; input: Record<string, unknown> }
-type Grader = (out: Record<string, unknown>, ticket: Ticket, gold: Gold | undefined) => Check[];
+/** What a grader may look at besides the answer. `gold` is the phase's own shape. */
+interface GradeCtx<G> { ticket: Ticket; gold: G | undefined; prior: Record<string, Artifact | null>; base?: string; dirty: string[] }
+type Grader<G = unknown> = (out: Artifact, ctx: GradeCtx<G>) => Check[];
 
 // ---------------------------------------------------------------- graders --
 
@@ -108,8 +117,10 @@ const PATH_RE = /(?:[\w.-]+\/)+[\w.-]+\.\w+|\b[\w-]+(?:\.[\w-]+)*\.(?:py|jsx?|ts
 
 const paths = (text: string): string[] => (text.match(PATH_RE) ?? []).map((p) => p.replace(/^\.\//, ''));
 
+interface RecallGold { must: number[]; ok: number[]; why: string }
+
 /** docs/rubrics/recall.md, check for check. Judges the answer only — see outOfMemory. */
-const gradeRecall: Grader = (out, ticket, gold) => {
+const gradeRecall: Grader<RecallGold> = (out, { ticket, gold }) => {
   const prior = (out.priorTickets as Array<{ iid: number; gotchas?: string[] }>) ?? [];
   const cited = prior.map((p) => Number(p.iid));
   const brief = String(out.brief ?? '').trim();
@@ -155,7 +166,89 @@ const gradeRecall: Grader = (out, ticket, gold) => {
   return checks;
 };
 
-const GRADERS: Record<string, Grader> = { recall: gradeRecall };
+interface PlanGold { base: string; must: string[]; ok: string[]; migrations: boolean; why: string }
+
+/** Every path and every directory in the tree at `base`, read once per commit. */
+const trees = new Map<string, { files: Set<string>; dirs: Set<string> }>();
+function treeAt(base: string): { files: Set<string>; dirs: Set<string> } {
+  let t = trees.get(base);
+  if (t) return t;
+  const files = new Set(execFileSync('git', ['ls-tree', '-r', '--name-only', base], {
+    cwd: WORK_REPO, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+  }).split('\n').filter(Boolean));
+  const dirs = new Set<string>();
+  for (const f of files) for (let i = f.indexOf('/'); i > 0; i = f.indexOf('/', i + 1)) dirs.add(f.slice(0, i));
+  t = { files, dirs };
+  trees.set(base, t);
+  return t;
+}
+
+/** A plan names `path/to/file.py:42` or a directory as often as a bare path. */
+const planPath = (f: string): string => f.trim().replace(/^\.\//, '').replace(/:\d+(?:-\d+)?$/, '').replace(/\/$/, '');
+
+/** A frontend unit test: plan's prompt forbids them (the Jest toolchain has rotted and CI never runs it). */
+const JEST_RE = /^frontend\/.*(?:__tests__|__snapshots__|\.(?:test|spec)\.[jt]sx?$|\.snap$)/;
+
+/** docs/rubrics/plan.md, check for check. Every check is a rule the plan prompt states. */
+const gradePlan: Grader<PlanGold> = (out, { gold, prior, base, dirty }) => {
+  const steps = (out.steps as Array<{ n: number; what: string; files: string[]; layer: string }>) ?? [];
+  const coverage = (out.acceptanceCoverage as Array<{ status: string; note: string }>) ?? [];
+  const criteria = ((prior.research?.acceptanceCriteria as unknown[]) ?? []).length;
+  const files = [...new Set(steps.flatMap((s) => s.files.map(planPath)).filter(Boolean))];
+  const tree = base ? treeAt(base) : null;
+  // A file the plan creates is real when its directory already is, or that
+  // directory's parent is — a first test often opens a new __tests__/.
+  const up = (f: string, k: number): string => f.split('/').slice(0, -k).join('/');
+  const unreal = tree ? files.filter((f) => !tree.files.has(f) && !tree.dirs.has(f) && !tree.dirs.has(up(f, 1)) && !tree.dirs.has(up(f, 2))) : [];
+  const jest = steps.filter((s) => s.files.some((f) => JEST_RE.test(planPath(f))) || /\bjest\b/i.test(s.what));
+  const migrates = steps.some((s) => s.layer === 'migration' || s.files.some((f) => f.includes('/migrations/')));
+  const unexplained = coverage.filter((c) => c.status !== 'covered' && !c.note.trim()).length;
+  const checks: Check[] = [
+    { name: 'coverage', pass: coverage.length === criteria, note: `${coverage.length} of ${criteria} criteria` },
+    { name: 'coverage-explained', pass: unexplained === 0, note: unexplained ? `${unexplained} partial/not-satisfiable without a note` : '' },
+    {
+      name: 'steps',
+      pass: steps.length > 0 && steps.every((s, i) => s.n === i + 1 && s.files.length > 0),
+      note: steps.filter((s, i) => s.n !== i + 1 || !s.files.length).map((s) => `step ${s.n}`).join(', '),
+    },
+    { name: 'files-real', pass: unreal.length === 0, note: unreal.join(', ') },
+    { name: 'no-jest', pass: jest.length === 0, note: jest.map((s) => `step ${s.n}`).join(', ') },
+    { name: 'migrations-flag', pass: out.migrations === migrates, note: `flag ${out.migrations}, steps ${migrates}` },
+    { name: 'no-feedback', pass: ((out.feedbackResponse as unknown[]) ?? []).length === 0 },
+    { name: 'read-only', pass: dirty.length === 0, note: dirty.slice(0, 5).join(', ') },
+  ];
+  if (gold) {
+    const missed = gold.must.filter((f) => !files.includes(f));
+    const extra = files.filter((f) => !gold.must.includes(f) && !gold.ok.includes(f));
+    checks.push(
+      {
+        name: 'gold-files',
+        pass: missed.length === 0,
+        note: [...missed.map((f) => `missed ${f}`), extra.length ? `+${extra.length} outside the real change` : ''].filter(Boolean).join(', '),
+      },
+      { name: 'gold-migrations', pass: out.migrations === gold.migrations },
+    );
+  }
+  return checks;
+};
+
+/**
+ * One entry per wired phase. `prior` is which live-run artifacts the phase is
+ * handed, frozen on first use; a phase whose cwd is the worktree gets its own
+ * detached checkout at the gold `base` per sample.
+ */
+interface PhaseEval {
+  grade: Grader<never>;
+  memory?: boolean;
+  prior?: string[];
+  stray?: (calls: ToolCall[], worktree?: string) => string[];
+  /** Time, turns and strays become checks in the score, not only columns beside it. Tokens never do. */
+  scoreCost?: boolean;
+}
+const PHASES: Record<string, PhaseEval> = {
+  recall: { grade: gradeRecall, memory: true, stray: outOfMemory },
+  plan: { grade: gradePlan, prior: ['recall', 'research'], stray: outsideWorktree, scoreCost: true },
+};
 
 /**
  * The tool calls that reached outside the memory. recall reads memory and
@@ -186,6 +279,53 @@ function outOfMemory(calls: ToolCall[]): string[] {
     }
   }
   return out;
+}
+
+/** Paths any shell command may name without leaving the job: devices, tools, temp, and ~/.<tool> dirs like ~/.pyenv. */
+const SYSTEM_PATH = new RegExp(`^(?:/(?:dev|usr|bin|sbin|opt|tmp|private/tmp|var/folders)/|${homedir()}/\\.)`);
+
+/** Absolute and ~/ paths in a shell command — only where a word starts, so the tail of a relative glob is not one. */
+const shellPaths = (cmd: string): string[] =>
+  (cmd.match(/(?<=^|[\s'"=(])~?\/[^\s'"|;&)<>:]+/g) ?? []).map((p) => p.replace(/^~/, homedir()));
+
+/**
+ * The tool calls that left the worktree or changed a file. plan reads its own
+ * checkout and nothing else ("Do not write or modify any code"), so an edit is
+ * a stray wherever it lands, and so is a read of another repo — the prompt
+ * tells every phase the other checkouts on this machine are live.
+ */
+function outsideWorktree(calls: ToolCall[], worktree?: string): string[] {
+  if (!worktree) return [];
+  const inside = (p: string): boolean => p.startsWith(worktree) || SYSTEM_PATH.test(p);
+  const out: string[] = [];
+  for (const c of calls) {
+    if (['Edit', 'Write', 'MultiEdit', 'NotebookEdit'].includes(c.name)) {
+      out.push(`${c.name} ${String(c.input.file_path ?? '')}`);
+      continue;
+    }
+    const paths = ['Read', 'Glob', 'Grep', 'LS'].includes(c.name)
+      ? [String(c.input.file_path ?? c.input.path ?? '')].filter(Boolean)
+      : c.name === 'Bash'
+        ? shellPaths(String(c.input.command ?? ''))
+        : [];
+    const away = paths.find((p) => !inside(p));
+    if (away) out.push(`${c.name} ${away}`);
+  }
+  return out;
+}
+
+/**
+ * Time, turns and strays as checks, against the phase's own limits in
+ * config/phases.json. Tokens are left out on purpose: they stay in the
+ * `weighted` column and `over`, reported and never scored.
+ */
+function costChecks(secs: number, turns: number, strays: string[] | null, limits: { maxTurns: number; timeoutSecs: number }): Check[] {
+  const checks: Check[] = [
+    { name: 'time', pass: secs < limits.timeoutSecs, note: `${Math.round(secs)}s of ${limits.timeoutSecs}s` },
+    { name: 'turns', pass: turns < limits.maxTurns, note: `${turns} of ${limits.maxTurns}` },
+  ];
+  if (strays) checks.push({ name: 'no-stray', pass: strays.length === 0, note: strays.slice(0, 3).join(', ') });
+  return checks;
 }
 
 /**
@@ -255,6 +395,13 @@ function ticketFromTranscript(iid: number): Ticket | null {
  * arbisoft/erp, whose #74 is a different ticket. Asking GitLab for such an iid
  * would grade recall on the wrong ticket and say nothing about it.
  */
+/** When the live run on this iid started, so a re-read ticket shows only the comments it saw. */
+function liveRunStart(iid: number): number | undefined {
+  const file = join(ROOT, 'state', 'runs', String(iid), 'run.json');
+  if (!existsSync(file)) return undefined;
+  return (JSON.parse(readFileSync(file, 'utf8')) as { createdAt?: number }).createdAt;
+}
+
 function liveRunProject(iid: number): string | null {
   const file = join(ROOT, 'state', 'runs', String(iid), 'run.json');
   if (!existsSync(file)) return null;
@@ -312,9 +459,9 @@ async function loadTicket(iid: number, refetch: boolean): Promise<Ticket> {
     title: res.data.title,
     description: res.data.description,
     labels: res.data.labels,
-    notes: notes.data
-      .filter((n) => !n.system && n.body && !isMachineNote(n.body) && !n.body.startsWith('Oneshot '))
-      .map((n) => n.body),
+    // Only comments from before the live run: later ones carry the answers it
+    // produced and the feedback on them — a plan gate reply names the files.
+    notes: ticketComments(notes.data, liveRunStart(iid)),
   };
   mkdirSync(TICKETS, { recursive: true });
   writeFileSync(cached, JSON.stringify(ticket, null, 2));
@@ -328,6 +475,32 @@ function snapshotMemory(refresh: boolean): void {
   console.log(`memory snapshot taken from ${LIVE_MEMORY} — re-check evals/*/gold.json against it`);
 }
 
+/**
+ * The upstream artifacts the live run handed this phase, copied once so a
+ * later live run on the same iid cannot change the eval's inputs. Delete
+ * state/evals/prior/<iid>/ to re-take them.
+ */
+function frozenPrior(iid: number, names: string[]): Record<string, Artifact | null> {
+  const dir = join(PRIOR, String(iid));
+  const out: Record<string, Artifact | null> = {};
+  for (const name of names) {
+    const frozen = join(dir, `${name}.json`);
+    const live = join(ROOT, 'state', 'runs', String(iid), `${name}.json`);
+    if (!existsSync(frozen) && existsSync(live)) {
+      mkdirSync(dir, { recursive: true });
+      cpSync(live, frozen);
+    }
+    out[name] = existsSync(frozen) ? JSON.parse(readFileSync(frozen, 'utf8')) as Artifact : null;
+  }
+  return out;
+}
+
+/** Uncommitted changes in a sample's worktree — a read-only phase leaves none. */
+function dirtyFiles(worktree: string): string[] {
+  return execFileSync('git', ['status', '--porcelain'], { cwd: worktree, encoding: 'utf8' })
+    .split('\n').filter(Boolean).map((l) => l.slice(3));
+}
+
 /** Every replay starts from the snapshot, whatever the last one left behind. */
 function stageMemory(): void {
   rmSync(MEMORY, { recursive: true, force: true });
@@ -336,7 +509,7 @@ function stageMemory(): void {
 
 // ------------------------------------------------------------------- main --
 
-interface Sample { iid: number; n: number; score: number; checks: Check[]; turns: number; weighted: number; secs: number; over: boolean; stray: number; error?: string }
+interface Sample { iid: number; n: number; score: number; checks: Check[]; turns: number; weighted: number; secs: number; over: boolean; stray: number | null; error?: string }
 
 async function pool<T>(jobs: Array<() => Promise<T>>, width: number): Promise<T[]> {
   const out: T[] = new Array(jobs.length);
@@ -350,14 +523,16 @@ async function pool<T>(jobs: Array<() => Promise<T>>, width: number): Promise<T[
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const phase = argv[0] ?? '';
-  const grade = GRADERS[phase];
+  const spec = PHASES[phase];
   const cfg = phaseByName(phase);
-  if (!grade || !cfg) {
-    console.error(`usage: npm run eval -- <phase> [iid ...] [--n 3] [--refresh-memory] [--refetch]   phases: ${Object.keys(GRADERS).join(', ')}`);
+  if (!spec || !cfg) {
+    console.error(`usage: npm run eval -- <phase> [iid ...] [--n 3] [--refresh-memory] [--refetch] [--live]   phases: ${Object.keys(PHASES).join(', ')}`);
     process.exit(2);
   }
+  const liveOnly = argv.includes('--live');
   const nAt = argv.indexOf('--n');
-  const n = nAt >= 0 ? Number(argv[nAt + 1]) : 3;
+  // A live artifact is one answer; sampling it again changes nothing.
+  const n = liveOnly ? 1 : nAt >= 0 ? Number(argv[nAt + 1]) : 3;
   if (!Number.isInteger(n) || n < 1) {
     console.error('--n needs a positive integer');
     process.exit(2);
@@ -367,16 +542,31 @@ async function main(): Promise<void> {
     process.exit(2);
   }
   const goldFile = join(ROOT, 'evals', phase, 'gold.json');
-  const gold: Record<string, Gold> = existsSync(goldFile) ? JSON.parse(readFileSync(goldFile, 'utf8')).cases : {};
+  const grade = spec.grade as Grader<unknown>;
+  const gold: Record<string, { base?: string }> = existsSync(goldFile) ? JSON.parse(readFileSync(goldFile, 'utf8')).cases : {};
   const iids = argv.slice(1).filter((a, i, all) => /^\d+$/.test(a) && all[i - 1] !== '--n').map(Number);
   const targets = iids.length ? iids : Object.keys(gold).map(Number);
 
-  snapshotMemory(argv.includes('--refresh-memory'));
-  stageMemory();
+  if (spec.memory) {
+    snapshotMemory(argv.includes('--refresh-memory'));
+    stageMemory();
+  }
+  const worktreed = cfg.cwd === 'worktree';
+  for (const iid of targets) {
+    const base = gold[iid]?.base;
+    if (!worktreed) continue;
+    if (!base) throw new Error(`#${iid}: ${phase} reads code, so evals/${phase}/gold.json needs its \`base\` commit`);
+    try {
+      execFileSync('git', ['cat-file', '-e', `${base}^{commit}`], { cwd: WORK_REPO, stdio: 'ignore' });
+    } catch {
+      throw new Error(`#${iid}: ${base.slice(0, 10)} is not in ${WORK_REPO} — point GITLAB_REPO_URL and WORK_REPO at the ticket's project (see evals/${phase}/gold.json _about)`);
+    }
+  }
   const tag = new Date().toISOString().replace(/[:.]/g, '-');
   // Reported beside the score, never folded into it: the phase's own quota
   // budget and turn cap, so a runaway sample stands out.
   const budget = budgetConfig().phases?.[phase] ?? Infinity;
+  const limits = { budget, maxTurns: cfg.maxTurns ?? Infinity, timeoutSecs: cfg.timeoutMin * 60 };
   const outDir = join(EVALS, phase, tag);
 
   const tickets = new Map<number, Ticket>();
@@ -384,26 +574,52 @@ async function main(): Promise<void> {
 
   const jobs = targets.flatMap((iid) => Array.from({ length: n }, (_, k) => async (): Promise<Sample> => {
     const ticket = tickets.get(iid)!;
+    const prior = frozenPrior(iid, spec.prior ?? []);
+    const base = gold[iid]?.base;
+    const grading = (dirty: string[]): GradeCtx<unknown> => ({ ticket, gold: gold[iid], prior, base, dirty });
+    if (liveOnly) {
+      // The live run's own answer, graded as it stands: a baseline that costs nothing.
+      const file = join(ROOT, 'state', 'runs', String(iid), `${phase}.json`);
+      const out = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) as Artifact : null;
+      const checks: Check[] = out ? grade(out, grading([])) : [{ name: 'produced', pass: false, note: `no live ${phase}.json` }];
+      const live = liveCost(iid, phase);
+      const run = JSON.parse(readFileSync(join(ROOT, 'state', 'runs', String(iid), 'run.json'), 'utf8')) as { worktree?: string };
+      const liveTee = join(ROOT, 'state', 'runs', String(iid), 'transcripts', `${phase}-lap0.jsonl`);
+      const strays = spec.stray ? spec.stray(toolCalls(liveTee, 0), run.worktree ?? undefined) : null;
+      if (out && live && spec.scoreCost) checks.push(...costChecks(live.secs, live.turns, strays, limits));
+      const score = checks.filter((c) => c.pass).length / checks.length;
+      return { iid, n: k, score, checks, turns: live?.turns ?? 0, weighted: live?.weighted ?? 0, secs: live?.secs ?? 0, over: false, stray: strays?.length ?? null };
+    }
+    const runId = `eval-${tag}-${iid}-${k}`;
+    const worktree = worktreed ? replayWorktree(`eval-${phase}-${iid}-${k}-${tag}`, base!) : undefined;
     const ctx: PromptCtx = {
-      ticket, runId: `eval-${tag}`, lap: k,
-      journal: { runId: `eval-${tag}`, iid, title: ticket.title, phases: [] } as unknown as RunJournal,
-      prior: {},
+      ticket, runId, lap: k, worktree,
+      journal: { runId, iid, title: ticket.title, phases: [] } as unknown as RunJournal,
+      prior,
     };
     const tee = transcriptPath(iid, cfg.name, k);
     const from = existsSync(tee) ? statSync(tee).size : 0;
     const startedAt = Date.now();
-    const res = await runPhase({
-      iid, runId: `eval-${tag}-${iid}-${k}`, lap: k, cfg,
-      prompt: promptFor(cfg, ctx), systemPrompt: systemPromptFor(cfg, ctx),
-    });
+    let res: Awaited<ReturnType<typeof runPhase>>;
+    let dirty: string[] = [];
+    try {
+      res = await runPhase({
+        iid, runId, lap: k, cfg, worktree,
+        prompt: promptFor(cfg, ctx), systemPrompt: systemPromptFor(cfg, ctx),
+      });
+      if (worktree) dirty = dirtyFiles(worktree);
+    } finally {
+      if (worktree) removeReplayWorktree(worktree);
+    }
     const secs = (Date.now() - startedAt) / 1000;
-    const checks: Check[] = res.data ? grade(res.data, ticket, gold[iid]) : [{ name: 'produced', pass: false, note: res.error ?? res.blocked ?? 'no output' }];
-    const strays = outOfMemory(toolCalls(tee, from));
-    const over = res.weighted > budget || res.turns >= (cfg.maxTurns ?? Infinity) || secs >= cfg.timeoutMin * 60;
+    const checks: Check[] = res.data ? grade(res.data, grading(dirty)) : [{ name: 'produced', pass: false, note: res.error ?? res.blocked ?? 'no output' }];
+    const strays = spec.stray ? spec.stray(toolCalls(tee, from), worktree) : null;
+    if (res.data && spec.scoreCost) checks.push(...costChecks(secs, res.turns, strays, limits));
+    const over = res.weighted > budget || res.turns >= limits.maxTurns || secs >= limits.timeoutSecs;
     const score = checks.filter((c) => c.pass).length / checks.length;
     mkdirSync(join(outDir, String(iid)), { recursive: true });
     writeFileSync(join(outDir, String(iid), `${k}.json`), JSON.stringify({ output: res.data, checks, score, turns: res.turns, weighted: res.weighted, secs, over, strays }, null, 2));
-    return { iid, n: k, score, checks, turns: res.turns, weighted: res.weighted, secs, over, stray: strays.length, error: res.error };
+    return { iid, n: k, score, checks, turns: res.turns, weighted: res.weighted, secs, over, stray: strays?.length ?? null, error: res.error };
   }));
   const samples = await pool(jobs, PARALLEL);
 
@@ -419,7 +635,7 @@ async function main(): Promise<void> {
       weighted: mine.reduce((a, s) => a + s.weighted, 0) / mine.length,
       secs: mine.reduce((a, s) => a + s.secs, 0) / mine.length,
       over: mine.filter((s) => s.over).length,
-      stray: mine.reduce((a, s) => a + s.stray, 0) / mine.length,
+      stray: spec.stray ? mine.reduce((a, s) => a + (s.stray ?? 0), 0) / mine.length : null,
       live: liveCost(iid, phase),
       failed: [...fails].map(([c, k]) => `${c} ${k}/${mine.length}`).join(', '),
     };
@@ -432,15 +648,18 @@ async function main(): Promise<void> {
   const prev = previous
     ? JSON.parse(readFileSync(join(EVALS, phase, previous, 'summary.json'), 'utf8')) as { overall: number; rows: Array<{ iid: number; weighted: number }> }
     : null;
-  mkdirSync(outDir, { recursive: true });
-  writeFileSync(join(outDir, 'summary.json'), JSON.stringify({ phase, tag, n, overall, rows }, null, 2));
+  // A live baseline is not an eval of this checkout, so it never becomes `previous`.
+  if (!liveOnly) {
+    mkdirSync(outDir, { recursive: true });
+    writeFileSync(join(outDir, 'summary.json'), JSON.stringify({ phase, tag, n, overall, rows }, null, 2));
+  }
 
   /** Signed percent change, or a dash when there is nothing to compare with. */
   const delta = (now: number, then: number | undefined): string =>
     then ? `${now >= then ? '+' : ''}${Math.round(((now - then) / then) * 100)}%` : '—';
   const sum = (xs: number[]): number => xs.reduce((a, x) => a + x, 0);
 
-  console.log(`\n${phase} eval — ${targets.length} tickets × ${n} samples   ${outDir}\n`);
+  console.log(`\n${phase} eval${liveOnly ? ' (live artifacts, no replay)' : ''} — ${targets.length} tickets × ${n} samples   ${outDir}\n`);
   console.log('ticket   score  turns  weighted  vs live  vs prev   secs  vs live  stray  over  failed checks');
   for (const r of rows) {
     console.log([
@@ -449,13 +668,17 @@ async function main(): Promise<void> {
       delta(r.weighted, r.live?.weighted).padStart(7),
       delta(r.weighted, prev?.rows.find((p) => p.iid === r.iid)?.weighted).padStart(7),
       Math.round(r.secs).toString().padStart(5), delta(r.secs, r.live?.secs).padStart(7),
-      r.stray.toFixed(1).padStart(5), `${r.over}/${n}`.padStart(4), r.failed || '—',
+      (r.stray === null ? '—' : r.stray.toFixed(1)).padStart(5), `${r.over}/${n}`.padStart(4), r.failed || '—',
     ].join('  '));
   }
   console.log('\nweighted = mean weighted tokens per sample (the config/budgets.json unit)');
-  console.log("vs live  = change against the live run's first recall attempt; vs prev = against the last eval");
+  console.log(`vs live  = change against the live run's first ${phase} attempt; vs prev = against the last eval`);
   console.log(`secs     = mean wall clock per sample, ${PARALLEL} replays at a time, so it runs above a lone live run`);
-  console.log('stray    = mean tool calls outside memory, reported and not scored');
+  if (spec.stray) {
+    console.log(spec.scoreCost
+      ? 'stray    = mean tool calls outside the worktree or edits; scored as no-stray, with time and turns'
+      : 'stray    = mean tool calls outside memory, reported and not scored');
+  }
   console.log(`over     = samples past ${budget} weighted, ${cfg.maxTurns ?? '∞'} turns or the ${cfg.timeoutMin}m timeout`);
   const live = rows.filter((r) => r.live);
   console.log(`\noverall ${overall.toFixed(2)}   weighted ${Math.round(sum(rows.map((r) => r.weighted)))}`
